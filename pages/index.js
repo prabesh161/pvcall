@@ -70,14 +70,21 @@ export default function Home() {
   const sendSignal = async (to, message) => {
     await fetch(SIGNAL_API, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+      },
       body: JSON.stringify({ to, from: userId, message }),
+      cache: 'no-store',
     })
   }
 
   const pollSignals = async (peerId) => {
     try {
-      const response = await fetch(`${SIGNAL_API}?peerId=${encodeURIComponent(peerId)}`)
+      const response = await fetch(`${SIGNAL_API}?peerId=${encodeURIComponent(peerId)}`, {
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-store' },
+      })
       const messages = await response.json()
       messages.forEach(handleSignal)
     } catch (error) {
@@ -111,6 +118,7 @@ export default function Home() {
     }
 
     if (message.type === 'ice') {
+      if (!message.candidate) return
       const candidate = new RTCIceCandidate(message.candidate)
       if (pcRef.current) {
         await pcRef.current.addIceCandidate(candidate)
@@ -155,7 +163,8 @@ export default function Home() {
 
     pc.onicecandidate = ({ candidate }) => {
       if (candidate && remotePeerId) {
-        sendSignal(remotePeerId, { type: 'ice', candidate })
+        const serializedCandidate = candidate.toJSON ? candidate.toJSON() : candidate
+        sendSignal(remotePeerId, { type: 'ice', candidate: serializedCandidate })
       }
     }
 
