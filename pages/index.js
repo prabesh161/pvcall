@@ -1,12 +1,17 @@
 import Head from 'next/head'
 import { useEffect, useRef, useState } from 'react'
 
-const generateId = () => `pv-${Math.random().toString(36).slice(2, 10)}`
 const SIGNAL_API = '/api/signal'
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ]
+const ALLOWED_ID_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*'
+
+const generateId = () =>
+  Array.from({ length: 6 }, () => ALLOWED_ID_CHARS[Math.floor(Math.random() * ALLOWED_ID_CHARS.length)]).join('')
+
+const isValidUserId = (value) => /^[A-Za-z0-9!@#$%^&*]{6}$/.test(value || '')
 
 export default function Home() {
   const [userId, setUserId] = useState('')
@@ -19,10 +24,14 @@ export default function Home() {
   const [notificationPermission, setNotificationPermission] = useState('default')
   const [errorMessage, setErrorMessage] = useState('')
   const [swStatus, setSwStatus] = useState('')
+  const [isScreenSharing, setIsScreenSharing] = useState(false)
 
   const pcRef = useRef(null)
   const localStreamRef = useRef(null)
+  const screenStreamRef = useRef(null)
   const audioRef = useRef(null)
+  const localVideoRef = useRef(null)
+  const remoteVideoRef = useRef(null)
   const ringtoneRef = useRef(null)
   const pendingCandidatesRef = useRef([])
   const pollingRef = useRef(null)
@@ -32,10 +41,11 @@ export default function Home() {
   useEffect(() => {
     if (typeof window === 'undefined') return
 
-    const storedId = localStorage.getItem('pvcall-user-id') || generateId()
-    localStorage.setItem('pvcall-user-id', storedId)
-    setUserId(storedId)
-    setEditableId(storedId)
+    const storedId = localStorage.getItem('pvcall-user-id')
+    const nextId = storedId && isValidUserId(storedId) ? storedId : generateId()
+    localStorage.setItem('pvcall-user-id', nextId)
+    setUserId(nextId)
+    setEditableId(nextId)
     setNotificationPermission(Notification.permission)
     setStatus(`Ready as ${storedId}`)
 
@@ -125,11 +135,15 @@ export default function Home() {
   const getLocalStream = async () => {
     if (localStreamRef.current) return localStreamRef.current
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true })
       localStreamRef.current = stream
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream
+        localVideoRef.current.muted = true
+      }
       return stream
     } catch (error) {
-      setErrorMessage('Microphone access is required for calls.')
+      setErrorMessage('Camera and microphone access are required for video calls.')
       throw error
     }
   }
@@ -146,8 +160,14 @@ export default function Home() {
     }
 
     pc.ontrack = (event) => {
-      audioRef.current.srcObject = event.streams[0]
-      audioRef.current.play().catch(() => {})
+      const incomingStream = event.streams[0]
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = incomingStream
+      }
+      if (audioRef.current) {
+        audioRef.current.srcObject = incomingStream
+        audioRef.current.play().catch(() => {})
+      }
       setCallActive(true)
       setStatus(`In call with ${remotePeerId}`)
     }
@@ -245,7 +265,7 @@ export default function Home() {
       setCallActive(true)
       setStatus(`Calling ${targetId}...`)
     } catch (error) {
-      setErrorMessage('Unable to start call. Check microphone permissions.')
+      setErrorMessage('Unable to start call. Check camera and microphone permissions.')
     }
   }
 
@@ -268,7 +288,7 @@ export default function Home() {
       setCallActive(true)
       setStatus(`In call with ${incomingCaller}`)
     } catch (error) {
-      setErrorMessage('Unable to answer call. Check microphone permissions.')
+      setErrorMessage('Unable to answer call. Check camera and microphone permissions.')
     }
   }
 
@@ -279,6 +299,45 @@ export default function Home() {
     setIncomingCaller('')
     setIncomingOffer(null)
     setStatus('Incoming call declined')
+  }
+
+  const toggleScreenShare = async () => {
+    if (!pcRef.current || !localStreamRef.current) return
+
+    try {
+      if (isScreenSharing && screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((track) => track.stop())
+        screenStreamRef.current = null
+        const sender = pcRef.current.getSenders().find((entry) => entry.track?.kind === 'video')
+        if (sender && localStreamRef.current.getVideoTracks()[0]) {
+          await sender.replaceTrack(localStreamRef.current.getVideoTracks()[0])
+        }
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = localStreamRef.current
+        }
+        setIsScreenSharing(false)
+        setStatus('Screen share stopped')
+        return
+      }
+
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+      const videoTrack = displayStream.getVideoTracks()[0]
+      const sender = pcRef.current.getSenders().find((entry) => entry.track?.kind === 'video')
+      if (sender && videoTrack) {
+        await sender.replaceTrack(videoTrack)
+      }
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = displayStream
+      }
+      screenStreamRef.current = displayStream
+      setIsScreenSharing(true)
+      setStatus('Screen sharing active')
+      displayStream.getVideoTracks()[0].addEventListener('ended', () => {
+        toggleScreenShare()
+      })
+    } catch (error) {
+      setErrorMessage('Unable to share your screen.')
+    }
   }
 
   const cleanupCall = (message) => {
@@ -294,6 +353,11 @@ export default function Home() {
       pcRef.current.close()
     }
 
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((track) => track.stop())
+      screenStreamRef.current = null
+    }
+
     pcRef.current = null
     dataChannelRef.current = null
     connectedPeerRef.current = null
@@ -301,6 +365,7 @@ export default function Home() {
     setCallActive(false)
     setIncomingCaller('')
     setIncomingOffer(null)
+    setIsScreenSharing(false)
     setStatus(message || `Ready as ${userId}`)
     stopRingtone()
   }
@@ -314,12 +379,14 @@ export default function Home() {
 
   const saveUserId = () => {
     const nextId = editableId.trim()
-    if (!nextId) {
-      setErrorMessage('User ID cannot be empty.')
+    if (!isValidUserId(nextId)) {
+      setErrorMessage('User ID must be exactly 6 characters using letters, numbers, or symbols.')
       return
     }
     localStorage.setItem('pvcall-user-id', nextId)
-    window.location.reload()
+    setUserId(nextId)
+    setStatus(`Your ID is now ${nextId}`)
+    setErrorMessage('')
   }
 
   const copyToClipboard = async () => {
@@ -373,8 +440,18 @@ export default function Home() {
 
           <div style={styles.section}>
             <div style={styles.sectionHeader}>
-              <span style={styles.sectionIcon}>🎯</span>
-              <span style={styles.sectionTitle}>Start a call</span>
+              <span style={styles.sectionIcon}>📹</span>
+              <span style={styles.sectionTitle}>Video call</span>
+            </div>
+            <div style={styles.videoGrid}>
+              <div style={styles.videoBox}>
+                <video ref={localVideoRef} autoPlay playsInline muted style={styles.video} />
+                <span style={styles.videoLabel}>You</span>
+              </div>
+              <div style={styles.videoBox}>
+                <video ref={remoteVideoRef} autoPlay playsInline style={styles.video} />
+                <span style={styles.videoLabel}>Remote</span>
+              </div>
             </div>
             <div style={styles.row}>
               <input
@@ -387,6 +464,13 @@ export default function Home() {
                 Call
               </button>
             </div>
+            {callActive && (
+              <div style={styles.actionRow}>
+                <button style={styles.subtleButton} type="button" onClick={toggleScreenShare}>
+                  {isScreenSharing ? 'Stop sharing' : 'Share screen'}
+                </button>
+              </div>
+            )}
           </div>
 
           <div style={styles.section}>
@@ -559,6 +643,36 @@ const styles = {
     gap: '0.75rem',
     alignItems: 'center',
     marginTop: '0.75rem',
+  },
+  videoGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: '0.75rem',
+    marginBottom: '0.75rem',
+  },
+  videoBox: {
+    borderRadius: '16px',
+    overflow: 'hidden',
+    background: '#0f172a',
+    border: '1px solid #e2e8f0',
+    minHeight: '180px',
+    position: 'relative',
+  },
+  video: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover',
+    background: '#0f172a',
+  },
+  videoLabel: {
+    position: 'absolute',
+    left: '0.6rem',
+    bottom: '0.6rem',
+    background: 'rgba(15, 23, 42, 0.7)',
+    color: '#fff',
+    padding: '0.3rem 0.6rem',
+    borderRadius: '999px',
+    fontSize: '0.8rem',
   },
   footer: {
     marginTop: '1rem',
