@@ -358,6 +358,17 @@ export default function Home() {
                 Copy
               </button>
             </div>
+            <div style={styles.row}>
+              <input
+                style={styles.input}
+                value={editableId}
+                onChange={(event) => setEditableId(event.target.value)}
+                placeholder="Choose a custom ID"
+              />
+              <button style={styles.subtleButton} type="button" onClick={saveUserId}>
+                Save ID
+              </button>
+            </div>
           </div>
 
           <div style={styles.section}>
@@ -547,6 +558,7 @@ const styles = {
     display: 'flex',
     gap: '0.75rem',
     alignItems: 'center',
+    marginTop: '0.75rem',
   },
   footer: {
     marginTop: '1rem',
