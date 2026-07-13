@@ -2,50 +2,32 @@ import Head from 'next/head'
 import { useEffect, useRef, useState } from 'react'
 
 const generateId = () => `pv-${Math.random().toString(36).slice(2, 10)}`
-
-const loadPeerJS = () => {
-  return new Promise((resolve, reject) => {
-    if (typeof window === 'undefined') {
-      reject(new Error('PeerJS requires a browser environment.'))
-      return
-    }
-
-    if (window.Peer) {
-      resolve(window.Peer)
-      return
-    }
-
-    const script = document.createElement('script')
-    script.src = 'https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js'
-    script.async = true
-    script.onload = () => {
-      if (window.Peer) {
-        resolve(window.Peer)
-      } else {
-        reject(new Error('PeerJS loaded but did not expose window.Peer.'))
-      }
-    }
-    script.onerror = () => reject(new Error('Failed to load PeerJS script.'))
-    document.body.appendChild(script)
-  })
-}
+const SIGNAL_API = '/api/signal'
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+]
 
 export default function Home() {
   const [userId, setUserId] = useState('')
   const [editableId, setEditableId] = useState('')
   const [remoteId, setRemoteId] = useState('')
   const [status, setStatus] = useState('Initializing...')
-  const [incomingPeer, setIncomingPeer] = useState(null)
+  const [incomingCaller, setIncomingCaller] = useState('')
+  const [incomingOffer, setIncomingOffer] = useState(null)
   const [callActive, setCallActive] = useState(false)
   const [notificationPermission, setNotificationPermission] = useState('default')
   const [errorMessage, setErrorMessage] = useState('')
   const [swStatus, setSwStatus] = useState('')
 
-  const peerRef = useRef(null)
+  const pcRef = useRef(null)
   const localStreamRef = useRef(null)
-  const currentCallRef = useRef(null)
   const audioRef = useRef(null)
   const ringtoneRef = useRef(null)
+  const pendingCandidatesRef = useRef([])
+  const pollingRef = useRef(null)
+  const connectedPeerRef = useRef(null)
+  const dataChannelRef = useRef(null)
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -55,42 +37,11 @@ export default function Home() {
     setUserId(storedId)
     setEditableId(storedId)
     setNotificationPermission(Notification.permission)
+    setStatus(`Ready as ${storedId}`)
 
-    const setupPeer = async () => {
-      try {
-        const PeerClass = await loadPeerJS()
-        const peer = new PeerClass(storedId, {
-          host: '0.peerjs.com',
-          port: 443,
-          path: '/',
-          secure: true,
-          config: {
-            iceServers: [
-              { urls: 'stun:stun.l.google.com:19302' },
-              { urls: 'stun:stun1.l.google.com:19302' },
-            ],
-          },
-        })
-
-        peer.on('open', () => setStatus(`Ready as ${storedId}`))
-        peer.on('error', (err) => setStatus(`Peer error: ${err.type || err}`))
-
-        peer.on('call', async (call) => {
-          setIncomingPeer(call)
-          setStatus(`Incoming call from ${call.peer}`)
-          requestNotificationPermission()
-          showIncomingNotification(call.peer)
-          playRingtone()
-        })
-
-        peerRef.current = peer
-      } catch (error) {
-        setStatus('Unable to initialize PeerJS client.')
-        setErrorMessage(error.message || 'PeerJS initialization failed.')
-      }
-    }
-
-    setupPeer()
+    pollingRef.current = window.setInterval(() => {
+      pollSignals(storedId)
+    }, 900)
 
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker
@@ -100,12 +51,76 @@ export default function Home() {
     }
 
     return () => {
-      currentCallRef.current?.close()
-      peer.destroy()
-      stopRingtone()
+      window.clearInterval(pollingRef.current)
+      cleanupCall('Reloading page')
       localStreamRef.current?.getTracks().forEach((track) => track.stop())
     }
   }, [])
+
+  const sendSignal = async (to, message) => {
+    await fetch(SIGNAL_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to, from: userId, message }),
+    })
+  }
+
+  const pollSignals = async (peerId) => {
+    try {
+      const response = await fetch(`${SIGNAL_API}?peerId=${encodeURIComponent(peerId)}`)
+      const messages = await response.json()
+      messages.forEach(handleSignal)
+    } catch (error) {
+      console.error('Signal polling failed', error)
+    }
+  }
+
+  const handleSignal = async ({ from, message }) => {
+    if (!message || !message.type) return
+
+    if (message.type === 'offer') {
+      if (callActive || incomingOffer) {
+        await sendSignal(from, { type: 'busy' })
+        return
+      }
+      setIncomingCaller(from)
+      setIncomingOffer(message.sdp)
+      setStatus(`Incoming call from ${from}`)
+      requestNotificationPermission()
+      showIncomingNotification(from)
+      playRingtone()
+      pendingCandidatesRef.current = []
+      return
+    }
+
+    if (message.type === 'answer' && pcRef.current) {
+      await pcRef.current.setRemoteDescription(message.sdp)
+      pendingCandidatesRef.current.forEach((candidate) => pcRef.current.addIceCandidate(candidate))
+      pendingCandidatesRef.current = []
+      return
+    }
+
+    if (message.type === 'ice') {
+      const candidate = new RTCIceCandidate(message.candidate)
+      if (pcRef.current) {
+        await pcRef.current.addIceCandidate(candidate)
+      } else {
+        pendingCandidatesRef.current.push(candidate)
+      }
+      return
+    }
+
+    if (message.type === 'bye') {
+      cleanupCall(`${from} ended the call`)
+      return
+    }
+
+    if (message.type === 'busy') {
+      setStatus(`${from} is busy`)
+      setCallActive(false)
+      return
+    }
+  }
 
   const getLocalStream = async () => {
     if (localStreamRef.current) return localStreamRef.current
@@ -119,6 +134,56 @@ export default function Home() {
     }
   }
 
+  const createPeerConnection = (remotePeerId) => {
+    cleanupCall('Starting new connection')
+
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate && remotePeerId) {
+        sendSignal(remotePeerId, { type: 'ice', candidate })
+      }
+    }
+
+    pc.ontrack = (event) => {
+      audioRef.current.srcObject = event.streams[0]
+      audioRef.current.play().catch(() => {})
+      setCallActive(true)
+      setStatus(`In call with ${remotePeerId}`)
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        cleanupCall('Connection ended')
+      }
+    }
+
+    pc.ondatachannel = (event) => {
+      const channel = event.channel
+      dataChannelRef.current = channel
+      channel.onmessage = handleDataChannelMessage
+    }
+
+    const dataChannel = pc.createDataChannel('pvcall')
+    dataChannel.onmessage = handleDataChannelMessage
+    dataChannelRef.current = dataChannel
+
+    pcRef.current = pc
+    connectedPeerRef.current = remotePeerId
+    return pc
+  }
+
+  const handleDataChannelMessage = (event) => {
+    try {
+      const data = JSON.parse(event.data)
+      if (data.type === 'bye') {
+        cleanupCall('Remote ended the call')
+      }
+    } catch (error) {
+      console.error('Invalid data channel message', error)
+    }
+  }
+
   const playRingtone = () => {
     if (ringtoneRef.current) return
     const AudioContext = window.AudioContext || window.webkitAudioContext
@@ -128,7 +193,7 @@ export default function Home() {
     const oscillator = audioCtx.createOscillator()
     const gain = audioCtx.createGain()
     oscillator.type = 'sine'
-    oscillator.frequency.value = 400
+    oscillator.frequency.value = 420
     gain.gain.value = 0.12
     oscillator.connect(gain).connect(audioCtx.destination)
     oscillator.start()
@@ -159,74 +224,92 @@ export default function Home() {
 
   const startCall = async () => {
     setErrorMessage('')
-    if (!remoteId.trim()) {
+    const targetId = remoteId.trim()
+    if (!targetId) {
       setErrorMessage('Enter the other user’s ID to start a call.')
       return
     }
-    if (!peerRef.current || peerRef.current.disconnected) {
-      setErrorMessage('Connection not ready. Reload the page.')
+    if (targetId === userId) {
+      setErrorMessage('Cannot call your own ID.')
       return
     }
 
     try {
       const stream = await getLocalStream()
-      const call = peerRef.current.call(remoteId.trim(), stream)
-      currentCallRef.current = call
-      setStatus(`Calling ${remoteId.trim()}...`)
+      const pc = createPeerConnection(targetId)
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream))
 
-      call.on('stream', (remoteStream) => {
-        setCallActive(true)
-        audioRef.current.srcObject = remoteStream
-        audioRef.current.play().catch(() => {})
-        setStatus(`In call with ${remoteId.trim()}`)
-      })
-
-      call.on('close', endCall)
-      call.on('error', () => endCall())
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      await sendSignal(targetId, { type: 'offer', sdp: offer })
+      setCallActive(true)
+      setStatus(`Calling ${targetId}...`)
     } catch (error) {
       setErrorMessage('Unable to start call. Check microphone permissions.')
     }
   }
 
   const answerCall = async () => {
-    if (!incomingPeer) return
+    if (!incomingCaller || !incomingOffer) return
     stopRingtone()
 
     try {
       const stream = await getLocalStream()
-      incomingPeer.answer(stream)
-      currentCallRef.current = incomingPeer
-      setIncomingPeer(null)
+      const pc = createPeerConnection(incomingCaller)
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream))
 
-      incomingPeer.on('stream', (remoteStream) => {
-        setCallActive(true)
-        audioRef.current.srcObject = remoteStream
-        audioRef.current.play().catch(() => {})
-        setStatus(`In call with ${incomingPeer.peer}`)
-      })
+      await pc.setRemoteDescription(incomingOffer)
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      await sendSignal(incomingCaller, { type: 'answer', sdp: answer })
 
-      incomingPeer.on('close', endCall)
-      incomingPeer.on('error', () => endCall())
+      setIncomingCaller('')
+      setIncomingOffer(null)
+      setCallActive(true)
+      setStatus(`In call with ${incomingCaller}`)
     } catch (error) {
       setErrorMessage('Unable to answer call. Check microphone permissions.')
     }
   }
 
-  const rejectCall = () => {
-    if (!incomingPeer) return
-    incomingPeer.close()
-    setIncomingPeer(null)
+  const rejectCall = async () => {
+    if (!incomingCaller) return
     stopRingtone()
+    await sendSignal(incomingCaller, { type: 'bye' })
+    setIncomingCaller('')
+    setIncomingOffer(null)
     setStatus('Incoming call declined')
   }
 
-  const endCall = () => {
-    currentCallRef.current?.close()
-    currentCallRef.current = null
+  const cleanupCall = (message) => {
+    if (dataChannelRef.current?.readyState === 'open') {
+      dataChannelRef.current.send(JSON.stringify({ type: 'bye' }))
+    }
+
+    if (pcRef.current) {
+      pcRef.current.onicecandidate = null
+      pcRef.current.ontrack = null
+      pcRef.current.ondatachannel = null
+      pcRef.current.onconnectionstatechange = null
+      pcRef.current.close()
+    }
+
+    pcRef.current = null
+    dataChannelRef.current = null
+    connectedPeerRef.current = null
+    pendingCandidatesRef.current = []
     setCallActive(false)
-    setIncomingPeer(null)
-    setStatus(`Ready as ${userId}`)
+    setIncomingCaller('')
+    setIncomingOffer(null)
+    setStatus(message || `Ready as ${userId}`)
     stopRingtone()
+  }
+
+  const endCall = async () => {
+    if (connectedPeerRef.current) {
+      await sendSignal(connectedPeerRef.current, { type: 'bye' })
+    }
+    cleanupCall('Call ended')
   }
 
   const saveUserId = () => {
@@ -312,9 +395,9 @@ export default function Home() {
             )}
           </div>
 
-          {incomingPeer && (
+          {incomingCaller && (
             <div style={styles.incoming}>
-              <p style={styles.incomingText}>Incoming call from <strong>{incomingPeer.peer}</strong></p>
+              <p style={styles.incomingText}>Incoming call from <strong>{incomingCaller}</strong></p>
               <div style={styles.actionRow}>
                 <button style={styles.button} type="button" onClick={answerCall}>
                   Answer

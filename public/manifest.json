@@ -1,0 +1,16 @@
+{
+  "name": "PVCall",
+  "short_name": "PVCall",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#4f46e5",
+  "description": "Peer-to-peer audio calling app with notifications and PWA support.",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    }
+  ]
+}
