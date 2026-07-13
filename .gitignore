@@ -1,0 +1,5 @@
+node_modules/
+.next/
+push_log.txt
+terminal_test_output.txt
+.DS_Store
